@@ -1,4 +1,6 @@
 import type { PlaybackPlan } from '@ValenceContracts/schemas/PlaybackPlan';
+import { chainRunsHere } from './chainRunsHere';
+import type { VerifiedChain } from './chainRunsHere';
 import type { SegmentContainer } from './segmentContainerFor';
 
 type VerifiedEncoder = {
@@ -12,6 +14,7 @@ type ToneMapping = 'zscale' | 'libplacebo' | 'unavailable';
 type Capabilities = {
   encoders: VerifiedEncoder[];
   rejected?: VerifiedEncoder[];
+  chains?: VerifiedChain[];
   toneMapping?: ToneMapping;
   canBurnTextSubtitles?: boolean;
   canBurnImageSubtitles?: boolean;
@@ -62,6 +65,7 @@ type PlanToSessionSpecOptions = {
   audioStreamIndex?: number;
   container: SegmentContainer;
   sourceVideoCodec?: string;
+  sourceBitDepth?: number;
 };
 
 type SpecOutcome =
@@ -116,15 +120,26 @@ const AUDIO_ENCODER = 'aac';
  * that one is used even if it was rejected at startup — forcing is how somebody investigates why it
  * was.
  *
- * @param capabilities - The encoders this server verified at startup, and those it rejected.
+ * A card that opens an encoder is not a card that runs the chain around it. The media service
+ * proves both at startup — one frame for the encoder, four through the whole graph at each depth —
+ * and until now only the first answer was read. A machine whose ten bit transcode chain had been
+ * measured and found broken was handed ten bit films anyway, and failed them one at a time. So a
+ * piece of hardware now has to have proved the shape as well as the encoder before it is preferred.
+ *
+ * Only the preference is withdrawn. Where nothing else can encode the codec at all the hardware is
+ * still used, a chain that failed a probe being a better bet than no picture.
+ *
+ * @param capabilities - The encoders this server verified at startup, those it rejected, and the chains it ran.
  * @param codec - The codec being encoded to.
  * @param forced - An acceleration an operator insisted on, or empty to choose freely.
+ * @param bitDepth - How deep the source is, the chains having been measured at eight bits and ten.
  * @returns The encoder to run, or null where this server can encode that codec no way at all.
  */
 const selectEncoder = (
   capabilities: Capabilities,
   codec: string,
   forced = '',
+  bitDepth?: number,
 ): VerifiedEncoder | null => {
   const wanted = forced.trim().toLowerCase();
 
@@ -142,8 +157,14 @@ const selectEncoder = (
     );
   }
 
+  const proved = (encoder: VerifiedEncoder) =>
+    chainRunsHere(capabilities.chains ?? [], encoder.accel, 'transcode', bitDepth);
+
   return (
-    capabilities.encoders.find((encoder) => encoder.codec === codec && encoder.accel !== 'none') ??
+    capabilities.encoders.find(
+      (encoder) => encoder.codec === codec && encoder.accel !== 'none' && proved(encoder),
+    ) ??
+    capabilities.encoders.find((encoder) => encoder.codec === codec && encoder.accel === 'none') ??
     capabilities.encoders.find((encoder) => encoder.codec === codec) ??
     null
   );
@@ -172,6 +193,7 @@ const planToSessionSpec = ({
   subtitleIndexes = [],
   container,
   sourceVideoCodec,
+  sourceBitDepth,
 }: PlanToSessionSpecOptions): SpecOutcome => {
   const isImageBased =
     plan.subtitles.kind === 'burnIn' && imageSubtitleIndexes.includes(plan.subtitles.streamIndex);
@@ -230,8 +252,8 @@ const planToSessionSpec = ({
 
   const targetCodec = plan.video.kind === 'transcode' ? plan.video.codec : 'h264';
   const chosen =
-    selectEncoder(capabilities, targetCodec, forcedAccel) ??
-    selectEncoder(capabilities, 'h264', forcedAccel);
+    selectEncoder(capabilities, targetCodec, forcedAccel, sourceBitDepth) ??
+    selectEncoder(capabilities, 'h264', forcedAccel, sourceBitDepth);
 
   if (chosen === null) {
     return {
