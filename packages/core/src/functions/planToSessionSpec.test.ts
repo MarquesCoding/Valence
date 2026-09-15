@@ -460,3 +460,105 @@ describe('the range the output really carries', () => {
     expect(outcome.kind === 'ok' && outcome.deliveredRange).toBe('SDR');
   });
 });
+
+describe('choosing an encoder against the chains the server actually ran', () => {
+  const hardwareAndSoftware: Capabilities = {
+    ...capabilities,
+    encoders: [
+      { codec: 'h264', encoder: 'h264_vaapi', accel: 'vaapi' },
+      { codec: 'h264', encoder: 'libx264', accel: 'none' },
+    ],
+  };
+
+  const encoderOf = (caps: Capabilities, bitDepth?: number) => {
+    const outcome = planToSessionSpec({
+      plan: { ...directPlay, video: transcodeVideo },
+      inputPath: '/media/film.mkv',
+      sourceRange: 'SDR',
+      capabilities: caps,
+      startSeconds: 0,
+      segmentSeconds: 4,
+      container: 'fmp4',
+      ...(bitDepth === undefined ? {} : { sourceBitDepth: bitDepth }),
+    });
+
+    return outcome.kind === 'ok' && outcome.spec.video.kind === 'encode'
+      ? outcome.spec.video.encoder
+      : null;
+  };
+
+  it('prefers the hardware where nothing was measured, as it always did', () => {
+    expect(encoderOf(hardwareAndSoftware)).toBe('h264_vaapi');
+  });
+
+  it('prefers the hardware where the chain was measured and works', () => {
+    const proved: Capabilities = {
+      ...hardwareAndSoftware,
+      chains: [{ accel: 'vaapi', shape: 'transcode', bitDepth: 10, works: true }],
+    };
+
+    expect(encoderOf(proved, 10)).toBe('h264_vaapi');
+  });
+
+  it('leaves the hardware alone where its chain was measured and does not work', () => {
+    const broken: Capabilities = {
+      ...hardwareAndSoftware,
+      chains: [{ accel: 'vaapi', shape: 'transcode', bitDepth: 10, works: false }],
+    };
+
+    expect(encoderOf(broken, 10)).toBe('libx264');
+  });
+
+  it('refuses it only at the depth that failed, not at the other one', () => {
+    const brokenDeep: Capabilities = {
+      ...hardwareAndSoftware,
+      chains: [
+        { accel: 'vaapi', shape: 'transcode', bitDepth: 8, works: true },
+        { accel: 'vaapi', shape: 'transcode', bitDepth: 10, works: false },
+      ],
+    };
+
+    expect(encoderOf(brokenDeep, 8)).toBe('h264_vaapi');
+    expect(encoderOf(brokenDeep, 10)).toBe('libx264');
+  });
+
+  it('does not let a broken sheet chain refuse a transcode', () => {
+    const brokenSheet: Capabilities = {
+      ...hardwareAndSoftware,
+      chains: [{ accel: 'vaapi', shape: 'sheet', bitDepth: 10, works: false }],
+    };
+
+    expect(encoderOf(brokenSheet, 10)).toBe('h264_vaapi');
+  });
+
+  it('still uses the hardware where it is the only thing that encodes at all', () => {
+    const nothingElse: Capabilities = {
+      ...capabilities,
+      encoders: [{ codec: 'h264', encoder: 'h264_vaapi', accel: 'vaapi' }],
+      chains: [{ accel: 'vaapi', shape: 'transcode', bitDepth: 10, works: false }],
+    };
+
+    expect(encoderOf(nothingElse, 10)).toBe('h264_vaapi');
+  });
+
+  it('still lets an operator force the hardware they are investigating', () => {
+    const outcome = planToSessionSpec({
+      plan: { ...directPlay, video: transcodeVideo },
+      inputPath: '/media/film.mkv',
+      sourceRange: 'SDR',
+      capabilities: {
+        ...hardwareAndSoftware,
+        chains: [{ accel: 'vaapi', shape: 'transcode', bitDepth: 10, works: false }],
+      },
+      forcedAccel: 'vaapi',
+      sourceBitDepth: 10,
+      startSeconds: 0,
+      segmentSeconds: 4,
+      container: 'fmp4',
+    });
+
+    expect(
+      outcome.kind === 'ok' && outcome.spec.video.kind === 'encode' && outcome.spec.video.encoder,
+    ).toBe('h264_vaapi');
+  });
+});
