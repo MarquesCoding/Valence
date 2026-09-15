@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tower::ServiceExt;
 
 use valence_transcoder::monitor::{Journal, Monitor};
@@ -240,6 +241,31 @@ fn reuse(body: &serde_json::Value) -> &str {
         .expect("a session says what it found")
 }
 
+/// How many of these tests may have ffmpeg encoding at once.
+///
+/// Ten tests here start real encodes, each against a registry that allows two of
+/// its own, and a CI runner has four cores to divide between them. The session
+/// waits two minutes for a manifest — six times what production allows — and ran
+/// out anyway on two consecutive runs, on a different test each time. A different
+/// test each time is what contention looks like; a broken one fails the same way
+/// twice.
+///
+/// Two is what the registry already allows a single session, so this holds the
+/// file to what one of its own tests is permitted rather than to a new number.
+static ENCODING_SLOTS: Semaphore = Semaphore::const_new(2);
+
+/// Waits for a turn at the processor, so the encodes in this file queue rather
+/// than thrash.
+///
+/// Held for the whole test rather than for the request that starts a session,
+/// because the session goes on encoding long after that request has returned.
+async fn a_turn_to_encode() -> SemaphorePermit<'static> {
+    ENCODING_SLOTS
+        .acquire()
+        .await
+        .expect("the semaphore is never closed")
+}
+
 /// Waits for a file to appear, so a test reads a directory in a known state
 /// rather than whichever one it happened to catch.
 async fn wait_for(path: &std::path::Path, timeout: Duration) -> bool {
@@ -262,6 +288,8 @@ async fn wait_for(path: &std::path::Path, timeout: Duration) -> bool {
 async fn says_nothing_was_reused_the_first_time_a_treatment_is_asked_for() {
     require_ffmpeg();
 
+    let _slot = a_turn_to_encode().await;
+
     let app = app(registry("first"));
 
     assert_eq!(reuse(&start(&app, &spec(&short_source())).await), "none");
@@ -270,6 +298,8 @@ async fn says_nothing_was_reused_the_first_time_a_treatment_is_asked_for() {
 #[tokio::test(flavor = "multi_thread")]
 async fn says_the_whole_transcode_was_reused_once_it_has_been_finished() {
     require_ffmpeg();
+
+    let _slot = a_turn_to_encode().await;
 
     let root = cache_root("finished");
     let app = app(registry("finished"));
@@ -302,6 +332,8 @@ async fn says_the_whole_transcode_was_reused_once_it_has_been_finished() {
 async fn says_a_transcode_is_shared_where_somebody_else_is_already_running_it() {
     require_ffmpeg();
 
+    let _slot = a_turn_to_encode().await;
+
     let app = app(registry("shared"));
     let spec = spec(&long_source());
 
@@ -324,6 +356,8 @@ async fn says_a_transcode_is_shared_where_somebody_else_is_already_running_it() 
 #[tokio::test(flavor = "multi_thread")]
 async fn tells_one_viewer_asking_twice_the_same_thing_both_times() {
     require_ffmpeg();
+
+    let _slot = a_turn_to_encode().await;
 
     let app = app(registry("asked-twice"));
     let spec = spec(&long_source());
@@ -350,6 +384,8 @@ async fn tells_one_viewer_asking_twice_the_same_thing_both_times() {
 async fn tells_one_viewer_asking_twice_the_same_thing_over_a_finished_transcode() {
     require_ffmpeg();
 
+    let _slot = a_turn_to_encode().await;
+
     let root = cache_root("asked-twice-finished");
     let app = app(registry("asked-twice-finished"));
     let spec = spec(&short_source());
@@ -373,6 +409,8 @@ async fn tells_one_viewer_asking_twice_the_same_thing_over_a_finished_transcode(
 #[tokio::test(flavor = "multi_thread")]
 async fn says_part_of_a_transcode_was_reused_where_a_session_was_abandoned() {
     require_ffmpeg();
+
+    let _slot = a_turn_to_encode().await;
 
     let root = cache_root("abandoned");
     let app = app(registry("abandoned"));
@@ -413,6 +451,8 @@ async fn says_part_of_a_transcode_was_reused_where_a_session_was_abandoned() {
 #[tokio::test(flavor = "multi_thread")]
 async fn does_not_encode_again_what_an_abandoned_run_already_finished() {
     require_ffmpeg();
+
+    let _slot = a_turn_to_encode().await;
 
     let root = cache_root("resumed");
     let app = app(registry("resumed"));
@@ -461,6 +501,8 @@ async fn does_not_encode_again_what_an_abandoned_run_already_finished() {
 async fn stops_counting_a_viewer_who_has_gone_as_somebody_to_share_with() {
     require_ffmpeg();
 
+    let _slot = a_turn_to_encode().await;
+
     let app = app(registry("left"));
     let spec = spec(&long_source());
 
@@ -506,6 +548,8 @@ async fn stops_counting_a_viewer_who_has_gone_as_somebody_to_share_with() {
 async fn tells_a_sharing_viewer_asking_twice_the_same_thing_both_times() {
     require_ffmpeg();
 
+    let _slot = a_turn_to_encode().await;
+
     let app = app(registry("shared-twice"));
     let spec = spec(&long_source());
 
@@ -535,6 +579,8 @@ async fn tells_a_sharing_viewer_asking_twice_the_same_thing_both_times() {
 #[tokio::test(flavor = "multi_thread")]
 async fn does_not_call_it_resumed_where_the_run_starts_where_it_would_have() {
     require_ffmpeg();
+
+    let _slot = a_turn_to_encode().await;
 
     let root = cache_root("elsewhere");
     let app = app(registry("elsewhere"));
