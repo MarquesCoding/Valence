@@ -562,3 +562,46 @@ describe('choosing an encoder against the chains the server actually ran', () =>
     ).toBe('h264_vaapi');
   });
 });
+
+describe('telling the media service what the source is, so it can undo it', () => {
+  const videoOf = (over: { sourceIsInterlaced?: boolean; sourcePixelAspect?: string | null }) => {
+    const outcome = planToSessionSpec({
+      plan: { ...directPlay, video: transcodeVideo },
+      inputPath: '/media/film.mkv',
+      sourceRange: 'SDR',
+      capabilities,
+      startSeconds: 0,
+      segmentSeconds: 4,
+      container: 'fmp4',
+      ...over,
+    });
+
+    return outcome.kind === 'ok' && outcome.spec.video.kind === 'encode' ? outcome.spec.video : null;
+  };
+
+  it('asks for the fields to be woven where the source was shot as fields', () => {
+    expect(videoOf({ sourceIsInterlaced: true })?.deinterlace).toBe(true);
+  });
+
+  it('says nothing about weaving for a progressive source, which is almost all of them', () => {
+    expect(videoOf({ sourceIsInterlaced: false })?.deinterlace).toBeUndefined();
+    expect(videoOf({})?.deinterlace).toBeUndefined();
+  });
+
+  it('asks for the pixels to be squared where the source says they are not', () => {
+    expect(videoOf({ sourcePixelAspect: '10/11' })?.squarePixels).toBe(true);
+  });
+
+  it('says nothing about squaring where the pixels are already square', () => {
+    expect(videoOf({ sourcePixelAspect: null })?.squarePixels).toBeUndefined();
+    expect(videoOf({})?.squarePixels).toBeUndefined();
+  });
+
+  it('asks for both where a source carries both, which old television does', () => {
+    const video = videoOf({ sourceIsInterlaced: true, sourcePixelAspect: '64/45' });
+
+    expect(video?.deinterlace).toBe(true);
+    expect(video?.squarePixels).toBe(true);
+  });
+});
+

@@ -151,6 +151,8 @@ fn spec(input: &std::path::Path) -> SessionSpec {
             max_width: 320,
             max_height: 180,
             tone_map: None,
+            deinterlace: false,
+            square_pixels: false,
         },
         audio: AudioAction::Copy,
         audio_stream_index: None,

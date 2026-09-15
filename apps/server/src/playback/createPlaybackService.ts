@@ -239,6 +239,8 @@ const createPlaybackService = ({
         sourceSize: [found.item.width, found.item.height],
         sourceVideoCodec: found.item.videoCodec,
         sourceBitDepth: found.item.videoBitDepth,
+        sourceIsInterlaced: found.item.videoIsInterlaced,
+        sourcePixelAspect: found.item.videoPixelAspect ?? null,
         imageSubtitleIndexes: found.item.subtitleStreams
           .filter((stream) => IMAGE_SUBTITLE_FORMATS.has(stream.format))
           .map((stream) => stream.index),

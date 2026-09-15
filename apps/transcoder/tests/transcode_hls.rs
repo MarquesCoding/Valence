@@ -418,6 +418,8 @@ async fn re_encodes_video_when_asked() {
             max_width: 160,
             max_height: 120,
             tone_map: None,
+            deinterlace: false,
+            square_pixels: false,
         },
         AudioAction::Copy,
     );
@@ -573,6 +575,8 @@ async fn answers_the_newest_request_when_a_viewer_scrubs_past_an_older_one() {
             max_width: 640,
             max_height: 360,
             tone_map: None,
+            deinterlace: false,
+            square_pixels: false,
         },
         audio: AudioAction::Copy,
         ..spec(VideoAction::Copy, AudioAction::Copy)
@@ -629,6 +633,8 @@ async fn serves_a_segment_beyond_a_transcode_that_has_run_ahead() {
             max_width: 640,
             max_height: 360,
             tone_map: None,
+            deinterlace: false,
+            square_pixels: false,
         },
         audio: AudioAction::Copy,
         ..spec(VideoAction::Copy, AudioAction::Copy)
@@ -877,6 +883,8 @@ async fn describes_the_whole_film_before_transcoding_it() {
             max_width: 1280,
             max_height: 720,
             tone_map: None,
+            deinterlace: false,
+            square_pixels: false,
         },
         audio: AudioAction::Copy,
         ..spec(VideoAction::Copy, AudioAction::Copy)
@@ -941,6 +949,8 @@ async fn starts_a_run_where_a_viewer_seeked_to() {
             max_width: 640,
             max_height: 360,
             tone_map: None,
+            deinterlace: false,
+            square_pixels: false,
         },
         audio: AudioAction::Copy,
         ..spec(VideoAction::Copy, AudioAction::Copy)
