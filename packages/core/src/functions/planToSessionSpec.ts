@@ -34,6 +34,8 @@ type SessionSpec = {
         maxWidth: number;
         maxHeight: number;
         toneMap?: ToneMapping;
+        deinterlace?: boolean;
+        squarePixels?: boolean;
       };
   audio:
     | { kind: 'copy' }
@@ -66,6 +68,8 @@ type PlanToSessionSpecOptions = {
   container: SegmentContainer;
   sourceVideoCodec?: string;
   sourceBitDepth?: number;
+  sourceIsInterlaced?: boolean;
+  sourcePixelAspect?: string | null;
 };
 
 type SpecOutcome =
@@ -194,6 +198,8 @@ const planToSessionSpec = ({
   container,
   sourceVideoCodec,
   sourceBitDepth,
+  sourceIsInterlaced = false,
+  sourcePixelAspect = null,
 }: PlanToSessionSpecOptions): SpecOutcome => {
   const isImageBased =
     plan.subtitles.kind === 'burnIn' && imageSubtitleIndexes.includes(plan.subtitles.streamIndex);
@@ -296,6 +302,8 @@ const planToSessionSpec = ({
         encoder: chosen.encoder,
         ...limits,
         ...(mapping.toneMap === undefined ? {} : { toneMap: mapping.toneMap }),
+        ...(sourceIsInterlaced ? { deinterlace: true } : {}),
+        ...(sourcePixelAspect === null ? {} : { squarePixels: true }),
       },
       audio:
         plan.audio.kind === 'transcode'

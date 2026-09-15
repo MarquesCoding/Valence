@@ -193,6 +193,8 @@ fn burn_in_spec(path: &Path, subtitle_index: u32, accel: HardwareAccel) -> Sessi
             max_width: 1920,
             max_height: 1080,
             tone_map: None,
+            deinterlace: false,
+            square_pixels: false,
         },
         audio: AudioAction::Copy,
         audio_stream_index: None,

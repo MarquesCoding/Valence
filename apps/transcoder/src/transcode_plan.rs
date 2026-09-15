@@ -124,6 +124,29 @@ pub enum VideoAction {
         max_height: u32,
         #[serde(default)]
         tone_map: Option<ToneMapping>,
+        /// Whether the fields have to be woven back into frames first.
+        ///
+        /// A source shot as fields is two half pictures taken a fiftieth of a
+        /// second apart and stored in one frame. Encoded as it stands, the
+        /// two show at once and everything that moved between them comes out
+        /// combed. The server decides this, since it is the one that knows the
+        /// client cannot weave them itself.
+        ///
+        /// Absent means progressive, which is what almost everything is.
+        #[serde(default)]
+        deinterlace: bool,
+        /// Whether the picture has to be stretched back to square pixels.
+        ///
+        /// Standard definition television was stored in frames whose pixels
+        /// are not square, and the shape is carried beside the picture rather
+        /// than in it. A client that cannot read that shape shows the film too
+        /// narrow or too wide, and the encode is being done for that client, so
+        /// it is done to the pixels rather than left as a note about them.
+        ///
+        /// Absent means the pixels are already square, which is 98% of a
+        /// library.
+        #[serde(default)]
+        square_pixels: bool,
     },
 }
 
@@ -368,12 +391,16 @@ impl SessionSpec {
                 max_width,
                 max_height,
                 tone_map,
+                deinterlace,
+                square_pixels,
             } => VideoAction::Encode {
                 encoder: software_equivalent(encoder).to_owned(),
                 max_bitrate_kbps: *max_bitrate_kbps,
                 max_width: *max_width,
                 max_height: *max_height,
                 tone_map: *tone_map,
+                deinterlace: *deinterlace,
+                square_pixels: *square_pixels,
             },
         };
 
@@ -695,17 +722,40 @@ fn device_chain(
     }
 }
 
+/// Weaving fields and squaring pixels are done in software, deliberately.
+///
+/// Both have hardware filters — `deinterlace_vaapi`, `deinterlace_qsv` — and
+/// neither is asked for here. A filter that is listed is not a filter that
+/// runs, which is the whole of VAL-85 and VAL-111, and nobody has put a file
+/// through those two on a card this project has seen. `yadif` and `setsar` ship
+/// with every build of `FFmpeg` there has ever been.
+///
+/// What it costs is bounded by what carries these faults. Fields and
+/// non-square pixels are both standard definition television, which encodes in
+/// software faster than it plays. A library of interlaced high definition
+/// broadcast would make this the wrong trade, and the answer then is to measure
+/// the hardware filters rather than to assume them.
 #[must_use]
 pub fn frame_route(spec: &SessionSpec, filters: DeviceFilters) -> FrameRoute {
     if !filters.scaler || spec.hardware_accel.pipeline().is_none() {
         return FrameRoute::InSoftware;
     }
 
-    let VideoAction::Encode { tone_map, .. } = &spec.video else {
+    let VideoAction::Encode {
+        tone_map,
+        deinterlace,
+        square_pixels,
+        ..
+    } = &spec.video
+    else {
         return FrameRoute::InSoftware;
     };
 
     if spec.source_size.is_none() {
+        return FrameRoute::InSoftware;
+    }
+
+    if *deinterlace || *square_pixels {
         return FrameRoute::InSoftware;
     }
 
@@ -737,22 +787,62 @@ pub fn keeps_frames_on_the_gpu(spec: &SessionSpec, filters: DeviceFilters) -> bo
     matches!(frame_route(spec, filters), FrameRoute::OnDevice)
 }
 
+/// Weaves the fields of an interlaced source back into frames.
+///
+/// The options are Jellyfin's and mean: one frame out for each frame in, work
+/// the field order out from the file, and weave every frame rather than only
+/// the ones marked. The first of those is the one that matters — the filter
+/// will happily emit a frame per *field* instead, which doubles the frame rate
+/// and the cost of the encode for a picture nobody asked to be smoother.
+const DEINTERLACE: &str = "yadif=0:-1:0";
+
+/// Stretches a picture whose pixels are not square until they are.
+///
+/// Two steps rather than one, and the order is the whole of it. This squares
+/// the picture at its own size and says so; the ordinary scale that follows
+/// then fits the result into the ceiling knowing the pixels are already square.
+///
+/// Folding the two together is the obvious simplification and it is wrong. A
+/// ceiling applied to width and height separately does not preserve the shape:
+/// measured on a 720x576 source with 64:45 pixels — sixteen by nine — held to
+/// 640x480, one step gives 640x480 and a picture squashed to four by three,
+/// where two steps give 640x360 and the shape it was shot in.
+///
+/// Widths are rounded down to even because an encoder will not take anything
+/// else. That is where the last fraction of a percent of the shape goes.
+const SQUARE_PIXELS: &str = "scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1";
+
 /// The complete video filter chain.
+///
+/// Weaving comes first. Fields are half pictures taken at different moments,
+/// and everything after this treats a frame as one moment — scaling an
+/// interlaced frame smears the two together past recovering.
 ///
 /// Tone mapping runs before scaling: converting a smaller picture is cheaper,
 /// but tone mapping the already-resampled result loses highlight detail that
-/// the mapping curve needs.
+/// the mapping curve needs. Squaring the pixels is a resample too, so it waits
+/// for the same reason.
 #[must_use]
 pub fn video_filter_chain(
     max_width: u32,
     max_height: u32,
     tone_map: Option<ToneMapping>,
     text_subtitles: Option<(&str, u32)>,
+    deinterlace: bool,
+    square_pixels: bool,
 ) -> String {
     let mut steps: Vec<String> = Vec::new();
 
+    if deinterlace {
+        steps.push(DEINTERLACE.to_owned());
+    }
+
     if let Some(filter) = tone_map.and_then(tone_map_filter) {
         steps.push(filter.to_owned());
+    }
+
+    if square_pixels {
+        steps.push(SQUARE_PIXELS.to_owned());
     }
 
     steps.push(scale_filter(max_width, max_height));
@@ -1486,6 +1576,8 @@ impl TranscodePlan {
                 max_width,
                 max_height,
                 tone_map,
+                deinterlace,
+                square_pixels,
             } => {
                 args.push("-c:v".into());
                 args.push(encoder.clone());
@@ -1554,32 +1646,56 @@ impl TranscodePlan {
                     }
                 }
 
-                let chain =
-                    video_filter_chain(*max_width, *max_height, *tone_map, self.text_burn_in());
+                let chain = video_filter_chain(
+                    *max_width,
+                    *max_height,
+                    *tone_map,
+                    self.text_burn_in(),
+                    *deinterlace,
+                    *square_pixels,
+                );
 
-                if let SubtitleAction::BurnIn {
-                    subtitle_index,
-                    is_image_based: true,
-                } = &self.spec.subtitles
-                {
-                    args.push("-filter_complex".into());
-                    args.push(self.software_composited_graph(
-                        &chain,
-                        *subtitle_index,
-                        *max_width,
-                        *max_height,
-                    ));
-                    self.push_graph_maps(args);
-
-                    is_mapped = true;
-                } else {
-                    args.push("-vf".into());
-                    args.push(chain);
-                }
+                is_mapped = self.push_software_video(args, &chain, *max_width, *max_height);
             }
         }
 
         is_mapped
+    }
+
+    /// Puts the software chain on the command, as a graph where a bitmap
+    /// subtitle has to be drawn over it and as a plain filter otherwise.
+    ///
+    /// A bitmap subtitle is a second stream, so it cannot be reached from a
+    /// linear chain and the whole thing becomes a graph with named outputs —
+    /// which is also why this answers whether it mapped the streams itself.
+    fn push_software_video(
+        &self,
+        args: &mut Vec<String>,
+        chain: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> bool {
+        if let SubtitleAction::BurnIn {
+            subtitle_index,
+            is_image_based: true,
+        } = &self.spec.subtitles
+        {
+            args.push("-filter_complex".into());
+            args.push(self.software_composited_graph(
+                chain,
+                *subtitle_index,
+                max_width,
+                max_height,
+            ));
+            self.push_graph_maps(args);
+
+            return true;
+        }
+
+        args.push("-vf".into());
+        args.push(chain.to_owned());
+
+        false
     }
 
     /// The subtitle the software chain renders itself, if there is one.
@@ -1933,6 +2049,8 @@ mod tests {
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             source_video_codec: Some("hevc".into()),
             ..spec()
@@ -2040,6 +2158,8 @@ mod tests {
                 max_width: 640,
                 max_height: 360,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             ..spec()
         };
@@ -2214,6 +2334,8 @@ mod tests {
                 max_width: 1280,
                 max_height: 720,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             ..spec()
         }
@@ -2240,6 +2362,8 @@ mod tests {
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::Qsv)
         };
@@ -2271,6 +2395,8 @@ mod tests {
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::Rkmpp)
         };
@@ -2354,6 +2480,8 @@ subtitles='/media/film.mkv':si=2,hwupload"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::Vaapi)
         };
@@ -2392,6 +2520,8 @@ subtitles='/media/film.mkv':si=2,hwupload"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::VideoToolbox)
         };
@@ -2426,6 +2556,8 @@ subtitles='/media/film.mkv':si=2,hwupload"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Libplacebo),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::Nvenc)
         };
@@ -2484,6 +2616,8 @@ subtitles='/media/film.mkv':si=2,hwupload"
                     max_width: 1280,
                     max_height: 720,
                     tone_map: Some(ToneMapping::Zscale),
+                    deinterlace: false,
+                    square_pixels: false,
                 },
                 ..on_gpu(accel)
             };
@@ -2506,6 +2640,8 @@ subtitles='/media/film.mkv':si=2,hwupload"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::Vaapi)
         };
@@ -2523,6 +2659,8 @@ subtitles='/media/film.mkv':si=2,hwupload"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             subtitles: SubtitleAction::BurnIn {
                 subtitle_index: 1,
@@ -2816,6 +2954,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::VideoToolbox)
         };
@@ -3101,6 +3241,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: Some(ToneMapping::Zscale),
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::VideoToolbox)
         };
@@ -3220,6 +3362,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             ..on_gpu(HardwareAccel::Vaapi)
         };
@@ -3424,6 +3568,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             ..spec()
         })
@@ -3474,6 +3620,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             ..spec()
         })
@@ -3677,11 +3825,137 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
         assert!(tone_map_filter(ToneMapping::Unavailable).is_none());
     }
 
+    /// Measured rather than reasoned about. A 704x576 source shot as fields, run
+    /// through the chain as it was, comes out with `idet` reporting 50 of 50
+    /// frames still interlaced. With the weave in front, 49 of 50 read as
+    /// progressive and the frame rate is unchanged at 25.
+    #[test]
+    fn weaves_the_fields_before_anything_resamples_them() {
+        use super::video_filter_chain;
+
+        let chain = video_filter_chain(1920, 1080, None, None, true, false);
+        let weave = chain.find("yadif").expect("weaves");
+        let scale = chain.find("scale=w=").expect("scales");
+
+        assert!(weave < scale, "weaving must precede scaling: {chain}");
+        assert!(chain.starts_with("yadif"), "{chain}");
+    }
+
+    /// One frame out per frame in. The filter will emit one per field instead,
+    /// which doubles the frame rate and the cost of the encode.
+    #[test]
+    fn asks_for_a_frame_per_frame_rather_than_a_frame_per_field() {
+        use super::video_filter_chain;
+
+        assert!(video_filter_chain(1920, 1080, None, None, true, false).contains("yadif=0:"));
+    }
+
+    #[test]
+    fn leaves_a_progressive_source_alone() {
+        use super::video_filter_chain;
+
+        let chain = video_filter_chain(1920, 1080, None, None, false, false);
+
+        assert!(!chain.contains("yadif"), "{chain}");
+        assert!(!chain.contains("setsar"), "{chain}");
+    }
+
+    /// Squaring is a resample, so it waits for the tone mapping like the scale
+    /// does, and comes before the ceiling is applied so the ceiling is measured
+    /// against square pixels.
+    #[test]
+    fn squares_the_pixels_after_tone_mapping_and_before_the_ceiling() {
+        use super::{video_filter_chain, ToneMapping};
+
+        let chain = video_filter_chain(1920, 1080, Some(ToneMapping::Zscale), None, false, true);
+
+        let map = chain.find("tonemap=").expect("maps");
+        let square = chain.find("setsar=1").expect("squares");
+        let ceiling = chain.rfind("scale=w='min(iw").expect("holds to a ceiling");
+
+        assert!(map < square, "tone mapping must precede squaring: {chain}");
+        assert!(
+            square < ceiling,
+            "squaring must precede the ceiling: {chain}"
+        );
+    }
+
+    /// The two steps exist because one does not work. Held to 640x480, a 16:9
+    /// source with 64:45 pixels comes out 640x360 through two steps and 640x480
+    /// — squashed to 4:3 — through one.
+    #[test]
+    fn squares_at_full_size_rather_than_inside_the_ceiling() {
+        use super::video_filter_chain;
+
+        let chain = video_filter_chain(640, 480, None, None, false, true);
+
+        assert!(
+            chain.contains("scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("force_original_aspect_ratio=decrease"),
+            "{chain}"
+        );
+    }
+
+    /// Neither filter runs on the device, so a source needing either is kept in
+    /// software rather than being handed to a chain that cannot do it.
+    #[test]
+    fn keeps_a_source_that_needs_weaving_or_squaring_in_software() {
+        use super::FrameRoute;
+
+        for (deinterlace, square_pixels) in [(true, false), (false, true), (true, true)] {
+            let spec = SessionSpec {
+                hardware_accel: HardwareAccel::Vaapi,
+                source_size: Some((1920, 1080)),
+                video: VideoAction::Encode {
+                    encoder: "h264_vaapi".into(),
+                    max_bitrate_kbps: 8000,
+                    max_width: 1920,
+                    max_height: 1080,
+                    tone_map: None,
+                    deinterlace,
+                    square_pixels,
+                },
+                ..spec()
+            };
+
+            assert_eq!(
+                frame_route(&spec, FULL),
+                FrameRoute::InSoftware,
+                "deinterlace={deinterlace} square_pixels={square_pixels}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_keeps_an_ordinary_source_on_the_device() {
+        use super::FrameRoute;
+
+        let spec = SessionSpec {
+            hardware_accel: HardwareAccel::Vaapi,
+            source_size: Some((1920, 1080)),
+            video: VideoAction::Encode {
+                encoder: "h264_vaapi".into(),
+                max_bitrate_kbps: 8000,
+                max_width: 1920,
+                max_height: 1080,
+                tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
+            },
+            ..spec()
+        };
+
+        assert_eq!(frame_route(&spec, FULL), FrameRoute::OnDevice);
+    }
+
     #[test]
     fn tone_maps_before_scaling_to_keep_highlight_detail() {
         use super::{video_filter_chain, ToneMapping};
 
-        let chain = video_filter_chain(1920, 1080, Some(ToneMapping::Zscale), None);
+        let chain = video_filter_chain(1920, 1080, Some(ToneMapping::Zscale), None, false, false);
         let map = chain.find("tonemap=").expect("maps");
         let scale = chain.find("scale=w=").expect("scales");
 
@@ -3692,7 +3966,7 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
     fn omits_tone_mapping_when_it_is_not_needed() {
         use super::video_filter_chain;
 
-        let chain = video_filter_chain(1920, 1080, None, None);
+        let chain = video_filter_chain(1920, 1080, None, None, false, false);
 
         assert!(
             !chain.contains("tonemap"),
@@ -3728,7 +4002,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
     fn draws_text_subtitles_after_scaling() {
         use super::video_filter_chain;
 
-        let chain = video_filter_chain(1920, 1080, None, Some(("/media/film.mkv", 2)));
+        let chain =
+            video_filter_chain(1920, 1080, None, Some(("/media/film.mkv", 2)), false, false);
         let scale = chain.find("scale=w=").expect("scales");
         let subs = chain.find("subtitles=").expect("draws subtitles");
 
@@ -3758,6 +4033,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             subtitles: SubtitleAction::BurnIn {
                 subtitle_index: 2,
@@ -3801,6 +4078,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             subtitles: SubtitleAction::BurnIn {
                 subtitle_index: 0,
@@ -3835,6 +4114,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             subtitles: SubtitleAction::BurnIn {
                 subtitle_index: 0,
@@ -3866,6 +4147,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             subtitles: SubtitleAction::BurnIn {
                 subtitle_index: 0,
@@ -3889,6 +4172,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             subtitles: SubtitleAction::BurnIn {
                 subtitle_index: 0,
@@ -3910,6 +4195,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             subtitles: SubtitleAction::BurnIn {
                 subtitle_index: 3,
@@ -3982,6 +4269,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1280,
                 max_height: 720,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             ..spec()
         };
@@ -4007,6 +4296,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             },
             ..spec()
         };
@@ -4022,6 +4313,8 @@ format=bgra,hwupload=derive_device=vaapi[sub]"
                 max_width: 1920,
                 max_height: 1080,
                 tone_map: None,
+                deinterlace: false,
+                square_pixels: false,
             }
         );
     }

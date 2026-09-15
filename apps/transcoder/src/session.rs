@@ -380,6 +380,8 @@ fn encode_instead(
             max_width,
             max_height,
             tone_map: None,
+            deinterlace: video.is_some_and(|stream| stream.is_interlaced),
+            square_pixels: video.is_some_and(|stream| stream.pixel_aspect.is_some()),
         },
         ..spec
     }
