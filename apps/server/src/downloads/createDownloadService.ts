@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isImageSubtitle } from '@ValenceCore/functions/isImageSubtitle';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { compareToOriginal } from '@ValenceCore/functions/compareToOriginal';
 import { describeQualityMeaning } from '@ValenceCore/functions/describeQualityMeaning';
@@ -15,8 +16,6 @@ import type { Transcoder } from '@ValenceServer/transcoder/TranscoderClient';
 import type { Download, DownloadQuality, Holding } from '@ValenceContracts/schemas/Download';
 import type { DownloadOffer, DownloadService } from './DownloadService';
 import type { MediaForDownload } from './MediaForDownload';
-
-const IMAGE_SUBTITLE_FORMATS = new Set(['pgs', 'vobsub', 'dvbsub']);
 
 const SEGMENT_SECONDS = 4;
 
@@ -120,7 +119,7 @@ const createDownloadService = ({
       sourceIsInterlaced: found.item.videoIsInterlaced,
       sourcePixelAspect: found.item.videoPixelAspect ?? null,
       imageSubtitleIndexes: found.item.subtitleStreams
-        .filter((stream) => IMAGE_SUBTITLE_FORMATS.has(stream.format))
+        .filter((stream) => isImageSubtitle(stream.format))
         .map((stream) => stream.index),
       subtitleIndexes: found.item.subtitleStreams.map((stream) => stream.index),
       capabilities: await capabilities(),
@@ -151,7 +150,7 @@ const createDownloadService = ({
           : wanted
         ).map((stream) => stream.index),
         subtitleStreamIndexes: found.item.subtitleStreams
-          .filter((stream) => !IMAGE_SUBTITLE_FORMATS.has(stream.format))
+          .filter((stream) => !isImageSubtitle(stream.format))
           .map((stream) => stream.index),
         generation: found.generation,
       },

@@ -479,13 +479,13 @@ describe('negotiatePlayback', () => {
     expect(plan.video.reason.code).toBe('VideoLevelNotSupported');
   });
 
-  it('passes supported text subtitles through', () => {
+  it('passes supported text subtitles through once one is asked for', () => {
     const withSubs: MediaItem = {
       ...media,
       subtitleStreams: [{ index: 2, format: 'srt', language: 'eng', isForced: false }],
     };
 
-    const plan = negotiatePlayback(withSubs, profile);
+    const plan = negotiatePlayback(withSubs, profile, undefined, undefined, 2);
 
     expect(plan.subtitles).toMatchObject({ kind: 'passthrough', streamIndex: 2 });
   });
@@ -496,9 +496,78 @@ describe('negotiatePlayback', () => {
       subtitleStreams: [{ index: 2, format: 'ass', language: 'eng', isForced: false }],
     };
 
-    const plan = negotiatePlayback(withSubs, profile);
+    const plan = negotiatePlayback(withSubs, profile, undefined, undefined, 2);
 
     expect(plan.subtitles).toMatchObject({ kind: 'sidecar', format: 'webvtt' });
+  });
+
+  it('leaves an ordinary text track off until somebody asks for it', () => {
+    const withSubs: MediaItem = {
+      ...media,
+      subtitleStreams: [{ index: 2, format: 'srt', language: 'eng', isForced: false }],
+    };
+
+    expect(negotiatePlayback(withSubs, profile).subtitles.kind).toBe('none');
+  });
+
+  it('turns on a forced track in the language being heard', () => {
+    const withSubs: MediaItem = {
+      ...media,
+      subtitleStreams: [{ index: 2, format: 'srt', language: 'eng', isForced: true }],
+    };
+
+    expect(negotiatePlayback(withSubs, profile).subtitles).toMatchObject({
+      kind: 'passthrough',
+      streamIndex: 2,
+    });
+  });
+
+  it('ignores a forced track belonging to a dub nobody is listening to', () => {
+    const withSubs: MediaItem = {
+      ...media,
+      subtitleStreams: [{ index: 2, format: 'srt', language: 'ita', isForced: true }],
+    };
+
+    expect(negotiatePlayback(withSubs, profile).subtitles.kind).toBe('none');
+  });
+
+  it('prefers a forced text track over a forced picture one, to avoid burning in', () => {
+    const both: MediaItem = {
+      ...media,
+      subtitleStreams: [
+        { index: 2, format: 'pgs', language: 'eng', isForced: true },
+        { index: 3, format: 'srt', language: 'eng', isForced: true },
+      ],
+    };
+
+    expect(negotiatePlayback(both, profile).subtitles).toMatchObject({
+      kind: 'passthrough',
+      streamIndex: 3,
+    });
+  });
+
+  it('takes the forced picture track where that is the only forced one there is', () => {
+    const onlyPictures: MediaItem = {
+      ...media,
+      subtitleStreams: [{ index: 2, format: 'pgs', language: 'eng', isForced: true }],
+    };
+
+    expect(negotiatePlayback(onlyPictures, profile).subtitles).toMatchObject({
+      kind: 'burnIn',
+      streamIndex: 2,
+    });
+  });
+
+  it('does not reach past the first subtitle stream to find something to turn on', () => {
+    const many: MediaItem = {
+      ...media,
+      subtitleStreams: [
+        { index: 2, format: 'srt', language: 'eng', isForced: false },
+        { index: 3, format: 'srt', language: 'fra', isForced: false },
+      ],
+    };
+
+    expect(negotiatePlayback(many, profile).subtitles.kind).toBe('none');
   });
 
   const withPgs = (isForced = false): MediaItem => ({

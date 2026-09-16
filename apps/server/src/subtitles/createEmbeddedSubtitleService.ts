@@ -1,11 +1,10 @@
 import { describeLanguage, readLanguage } from '@ValenceCore/functions/describeTrack';
+import { isImageSubtitle } from '@ValenceCore/functions/isImageSubtitle';
 import { trackId } from './SubtitleService';
 import type { SubtitleService, SubtitleTrack } from './SubtitleService';
 import { describeFailure } from '@ValenceServer/logging/describeFailure';
 
 const HEARING_IMPAIRED_MARKERS = ['sdh', 'cc', 'hearing', 'hard of hearing'];
-
-const IMAGE = new Set(['pgs', 'vobsub', 'dvbsub']);
 
 const UNREADABLE = new Set(['unknown']);
 
@@ -24,11 +23,6 @@ type EmbeddedLookup = {
 type Extractor = {
   readSubtitle: (request: { inputPath: string; streamIndex: number }) => Promise<string>;
 };
-
-/**
- * Whether this track is pictures rather than words.
- */
-const isImage = (format: string): boolean => IMAGE.has(format);
 
 type CreateEmbeddedSubtitleServiceOptions = {
   media: EmbeddedLookup;
@@ -116,12 +110,12 @@ const createEmbeddedSubtitleService = ({
         return null;
       }
 
-      const canBurn = found.streams.some((stream) => isImage(stream.format))
+      const canBurn = found.streams.some((stream) => isImageSubtitle(stream.format))
         ? await canBurnImageSubtitles()
         : false;
 
       const tracks: SubtitleTrack[] = found.streams
-        .filter((stream) => !isImage(stream.format) || canBurn)
+        .filter((stream) => !isImageSubtitle(stream.format) || canBurn)
         .map((stream, position) => ({
           id: idFor(found.path, stream.index),
           language: readLanguage(stream.language),
@@ -129,7 +123,7 @@ const createEmbeddedSubtitleService = ({
           format: stream.format,
           isForced: stream.isForced,
           isHearingImpaired: marksHearingImpaired(stream.title),
-          delivery: isImage(stream.format) ? ('burnIn' as const) : ('text' as const),
+          delivery: isImageSubtitle(stream.format) ? ('burnIn' as const) : ('text' as const),
           streamIndex: stream.index,
         }));
 
@@ -144,7 +138,7 @@ const createEmbeddedSubtitleService = ({
         return null;
       }
 
-      if (isImage(stream.format)) {
+      if (isImageSubtitle(stream.format)) {
         return null;
       }
 

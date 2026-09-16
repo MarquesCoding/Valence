@@ -1,4 +1,4 @@
-import type { MediaItem, SubtitleFormat, VideoRange } from '@ValenceContracts/schemas/MediaItem';
+import type { MediaItem, VideoRange } from '@ValenceContracts/schemas/MediaItem';
 import type { DeviceProfile } from '@ValenceContracts/schemas/DeviceProfile';
 import type {
   AudioDecision,
@@ -9,9 +9,9 @@ import type {
 } from '@ValenceContracts/schemas/PlaybackPlan';
 import type { QualityClamp } from './resolveQualityStep';
 import { selectAudioStream } from './describeTrack';
+import { isImageSubtitle } from './isImageSubtitle';
+import { selectForcedSubtitle } from './selectForcedSubtitle';
 import { encodeBitrateFor } from './encodeBitrateFor';
-const IMAGE_SUBTITLE_FORMATS: readonly SubtitleFormat[] = ['pgs', 'vobsub', 'dvbsub'];
-
 /**
  * Decides what the file should be delivered in: the container it is already in where the device
  * says it can play it, and the fallback the device asked for otherwise. Every decision carries the
@@ -419,32 +419,45 @@ const decideAudio = (
  * Decides what to do with subtitles: none where none was asked for, passed through where the device
  * renders the format itself, and otherwise converted to text or drawn into the picture.
  *
- * Drawing into the picture is the last resort and is never chosen on a viewer's behalf. It cannot be
- * turned off without restarting the stream, and it forces the picture to be encoded for as long as
- * it is on — so a film whose only subtitles are pictures plays without them until somebody asks,
- * rather than quietly costing every viewer a transcode they did not ask for.
+ * Nothing is turned on unasked. A viewer who has chosen no subtitle gets none, whatever the file
+ * carries — putting them on is a decision about how a film is watched and it is not this server's to
+ * make. The single exception is a forced track in the language being heard, which carries the parts
+ * of a film nobody is meant to miss, and where several of those qualify the text one wins over the
+ * pictures. See `selectForcedSubtitle`.
+ *
+ * Drawing into the picture stays the last resort. It cannot be turned off without restarting the
+ * stream and it forces the picture to be encoded for as long as it is on, so it happens only where a
+ * viewer asked for that track by name or where a forced track leaves no alternative.
  *
  * @param media - The file, as the catalogue holds it.
  * @param profile - What the device says it can render.
  * @param chosenStreamIndex - The stream a viewer picked, where they picked one.
+ * @param spokenLanguage - The language of the audio being heard, which decides whether a forced track belongs to this viewing.
  * @returns The subtitle decision and its reason.
  */
 const decideSubtitles = (
   media: MediaItem,
   profile: DeviceProfile,
   chosenStreamIndex?: number | null,
+  spokenLanguage?: string | null,
 ): SubtitleDecision => {
   const chosen =
     chosenStreamIndex === undefined || chosenStreamIndex === null
       ? undefined
       : media.subtitleStreams.find((candidate) => candidate.index === chosenStreamIndex);
 
-  const stream = chosen ?? media.subtitleStreams[0];
+  const stream = chosen ?? selectForcedSubtitle(media.subtitleStreams, spokenLanguage);
 
   if (stream === undefined) {
     return {
       kind: 'none',
-      reason: { code: 'ClientSupportsSource', detail: 'Source has no subtitle stream' },
+      reason: {
+        code: 'ClientSupportsSource',
+        detail:
+          media.subtitleStreams.length === 0
+            ? 'Source has no subtitle stream'
+            : 'No subtitle was asked for, and none is forced in the language being heard',
+      },
     };
   }
 
@@ -459,17 +472,7 @@ const decideSubtitles = (
     };
   }
 
-  if (IMAGE_SUBTITLE_FORMATS.includes(stream.format)) {
-    if (chosen === undefined && !stream.isForced) {
-      return {
-        kind: 'none',
-        reason: {
-          code: 'SubtitleFormatNotSupported',
-          detail: `${stream.format} is image based and has to be drawn into the picture, so it is off until it is asked for`,
-        },
-      };
-    }
-
+  if (isImageSubtitle(stream.format)) {
     return {
       kind: 'burnIn',
       streamIndex: stream.index,
@@ -515,7 +518,12 @@ const negotiatePlayback = (
   container: decideContainer(media, profile),
   video: decideVideo(media, profile, qualityClamp),
   audio: decideAudio(media, profile, qualityClamp, preferredAudioLanguage),
-  subtitles: decideSubtitles(media, profile, chosenSubtitleStreamIndex),
+  subtitles: decideSubtitles(
+    media,
+    profile,
+    chosenSubtitleStreamIndex,
+    selectAudioStream(media.audioStreams, preferredAudioLanguage)?.language,
+  ),
 });
 
 export { negotiatePlayback };

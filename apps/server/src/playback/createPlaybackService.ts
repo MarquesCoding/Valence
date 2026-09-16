@@ -1,4 +1,5 @@
 import { negotiatePlayback } from '@ValenceCore/functions/negotiatePlayback';
+import { isImageSubtitle } from '@ValenceCore/functions/isImageSubtitle';
 import { resolveQualityStep } from '@ValenceCore/functions/resolveQualityStep';
 import { describePlaybackMode } from '@ValenceContracts/functions/describePlaybackMode';
 import { planToSessionSpec } from '@ValenceCore/functions/planToSessionSpec';
@@ -24,8 +25,6 @@ import type {
 const TRICKPLAY_INDEX_NAME = 'thumbnails.vtt';
 
 const PREVIEW_NAME = 'preview.mp4';
-
-const IMAGE_SUBTITLE_FORMATS = new Set(['pgs', 'vobsub', 'dvbsub']);
 
 /**
  * Rewrites a plan to say what was actually done rather than what was decided, for the cases where
@@ -242,7 +241,7 @@ const createPlaybackService = ({
         sourceIsInterlaced: found.item.videoIsInterlaced,
         sourcePixelAspect: found.item.videoPixelAspect ?? null,
         imageSubtitleIndexes: found.item.subtitleStreams
-          .filter((stream) => IMAGE_SUBTITLE_FORMATS.has(stream.format))
+          .filter((stream) => isImageSubtitle(stream.format))
           .map((stream) => stream.index),
         subtitleIndexes: found.item.subtitleStreams.map((stream) => stream.index),
         capabilities: await capabilities(),
